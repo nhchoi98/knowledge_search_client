@@ -9,7 +9,8 @@ const ROUTER_TOOL_SELECTION_FORMAT_GUIDELINES = `
 - 탐색에도 실패하면 그때만 사용자에게 경로를 요청해라.
 `.trim();
 
-export const buildToolSelectionPrompt = (toolSummaries = []) => `
+export const buildToolSelectionPrompt = (toolSummaries = []) =>
+  `
 너는 로컬 MCP 라우팅 에이전트야.
 사용자 요청을 보고 JSON-RPC MCP 도구 목록 중에서 어떤 tool을 호출할지 결정해.
 항상 JSON 객체만 반환해.
@@ -30,7 +31,8 @@ ${ROUTER_TOOL_SELECTION_FORMAT_GUIDELINES}
 ${JSON.stringify(toolSummaries, null, 2)}
 `.trim();
 
-export const buildRouteDecisionPrompt = () => `
+export const buildRouteDecisionPrompt = () =>
+  `
 너는 로컬 MCP 라우터야.
 사용자 요청을 보고 로컬 MCP를 통해 처리해야 하는지 판단해.
 항상 JSON 객체만 반환해:
@@ -42,4 +44,5 @@ export const buildRouteDecisionPrompt = () => `
 로컬 MCP가 필요한 경우 route=local_mcp를 반환해.
 `.trim();
 
-export const CHAT_ONLY_PROMPT = '너는 지식 보조 어시스턴트야. 간결하고 정확하게 답변해. 로컬 MCP 호출은 필요하지 않다.';
+export const CHAT_ONLY_PROMPT =
+  '너는 지식 보조 어시스턴트야. 간결하고 정확하게 답변해. 로컬 MCP 호출은 필요하지 않다.';

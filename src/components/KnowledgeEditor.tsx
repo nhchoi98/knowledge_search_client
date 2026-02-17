@@ -1,20 +1,19 @@
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { type KeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppBar,
-  Avatar,
   Box,
-  Chip,
+  Button,
+  Collapse,
   Container,
   Divider,
-  IconButton,
   Paper,
   List,
   ListItem,
+  Stack,
   TextField,
   Typography,
 } from '@mui/material';
 import SendIcon from '@mui/icons-material/Send';
-import LogoutIcon from '@mui/icons-material/Logout';
 import type { MCPMode, KnowledgeMessage } from '../types/mcp';
 import { streamKnowledge } from '../services/mcpClient';
 
@@ -24,9 +23,14 @@ interface KnowledgeEditorProps {
   onDisconnect: () => void;
 }
 
-export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: KnowledgeEditorProps) {
+export default function KnowledgeEditor({
+  mode,
+  localEndpoint,
+  onDisconnect,
+}: KnowledgeEditorProps) {
   const [input, setInput] = useState('오늘 배운 내용 중 중요한 항목을 찾아 요약해줘.');
   const [loading, setLoading] = useState(false);
+  const [showSSELogs, setShowSSELogs] = useState(false);
   const [messages, setMessages] = useState<KnowledgeMessage[]>([
     {
       id: crypto.randomUUID(),
@@ -36,9 +40,10 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
     },
   ]);
   const endOfMessagesRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const title = useMemo(() => (mode === 'local' ? '로컬 MCP로 지식 탐색' : 'MCP 연결'), [mode]);
-  const status = useMemo(() => `로컬 MCP 엔드포인트: ${localEndpoint}`, [localEndpoint]);
+  const title = useMemo(() => (mode === 'local' ? 'Local MCP Chat' : 'MCP Chat'), [mode]);
+  const status = useMemo(() => `Endpoint: ${localEndpoint}`, [localEndpoint]);
 
   const appendThought = (messageId: string, thought: string) => {
     setMessages((prev) =>
@@ -75,21 +80,9 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
     return `${eventType}`;
   };
 
-  const summarizeResult = (result: unknown) => {
-    if (!result || typeof result !== 'object') {
-      return '';
-    }
-
-    try {
-      return `원문 result: ${JSON.stringify(result, null, 2)}`;
-    } catch {
-      return '';
-    }
-  };
-
   const renderMarkdown = (text: string) => {
     const rawLines = text.split('\n');
-    const nodes = [];
+    const nodes: ReactNode[] = [];
     let listItems: string[] = [];
     let pendingBuffer: string[] = [];
 
@@ -100,8 +93,14 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
       nodes.push(
         <Typography
           key={`p-${nodes.length}`}
-          variant="body2"
-          sx={{ whiteSpace: 'pre-wrap', display: 'block', mt: 1 }}
+          variant="body1"
+          sx={{
+            whiteSpace: 'pre-wrap',
+            display: 'block',
+            mt: 1,
+            lineHeight: 1.72,
+            color: '#0f172a',
+          }}
         >
           {pendingBuffer.join('\n')}
         </Typography>,
@@ -117,8 +116,12 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
       nodes.push(
         <List key={`ul-${nodes.length}`} dense sx={{ pl: 2, mt: 0.5 }}>
           {listItems.map((item, index) => (
-            <ListItem disableGutters key={`li-${nodes.length}-${index}`} sx={{ display: 'list-item', pl: 0.5 }}>
-              <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+            <ListItem
+              disableGutters
+              key={`li-${nodes.length}-${index}`}
+              sx={{ display: 'list-item', pl: 0.5 }}
+            >
+              <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap', color: '#0f172a' }}>
                 {item}
               </Typography>
             </ListItem>
@@ -140,7 +143,7 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
             key={`h-${nodes.length}`}
             variant={level >= 3 ? 'subtitle2' : 'subtitle1'}
             fontWeight={700}
-            sx={{ mt: 1.5, mb: 0.5 }}
+            sx={{ mt: 1.5, mb: 0.5, color: '#0f172a' }}
           >
             {content}
           </Typography>,
@@ -167,7 +170,7 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
     flushParagraph();
     flushList();
 
-    return nodes.length > 0 ? nodes : <Typography variant="body2">{text}</Typography>;
+    return nodes.length > 0 ? nodes : <Typography variant="body1">{text}</Typography>;
   };
 
   const submit = async () => {
@@ -200,7 +203,9 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
     try {
       await streamKnowledge(mode, trimmed, {
         localEndpoint,
-        conversation: nextMessages.filter((message) => message.role === 'user' || message.role === 'assistant'),
+        conversation: nextMessages.filter(
+          (message) => message.role === 'user' || message.role === 'assistant',
+        ),
         onProgress: ({ type, data }) => {
           appendThought(assistantMessage.id, makeThinkingLine(type, data));
         },
@@ -217,25 +222,13 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
           );
         },
         onFinal: (response) => {
-          const action = response.action || 'local-mcp';
           setMessages((prev) =>
             prev.map((message) =>
               message.id === assistantMessage.id
                 ? {
                     ...message,
                     isStreaming: false,
-                    text: `${response.answer}\n\n실행 액션: ${action}`,
-                    detail: [
-                      response.route && `라우팅: ${response.route}`,
-                      response.routedQuery ? `전달 쿼리: ${response.routedQuery}` : null,
-                      response.explanation && `판단: ${response.explanation}`,
-                      response.requiresInput ? `요청 보완 필요: ${response.missing || '추가 정보'}` : null,
-                      response.tool ? `도구: ${response.tool}` : null,
-                      response.arguments ? `인자: ${JSON.stringify(response.arguments, null, 2)}` : null,
-                      response.result ? summarizeResult(response.result) : null,
-                    ]
-                        .filter(Boolean)
-                        .join('\n\n'),
+                    text: response.answer,
                   }
                 : message,
             ),
@@ -256,7 +249,8 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
         },
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : '로컬 MCP 질의 중 오류가 발생했습니다.';
+      const message =
+        error instanceof Error ? error.message : '로컬 MCP 질의 중 오류가 발생했습니다.';
       setMessages((prev) =>
         prev.map((msg) =>
           msg.id === assistantMessage.id
@@ -291,35 +285,75 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
     }
   }, [messages, loading]);
 
+  useEffect(() => {
+    if (!loading && inputRef.current) {
+      inputRef.current.focus();
+    }
+  }, [loading]);
+
   return (
-    <Box sx={{ minHeight: '100vh', background: 'linear-gradient(145deg, #eef2ff 0%, #f8fafc 70%)', width: '100%' }}>
-      <AppBar position="sticky" color="default" elevation={0}>
-        <Container maxWidth="md" sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 1 }}>
-          <Typography variant="h6" color="primary" fontWeight={700} sx={{ flexGrow: 1 }}>
-            MCP Knowledge Hub
+    <Box sx={{ minHeight: '100vh', background: '#ffffff', width: '100%' }}>
+      <AppBar
+        position="sticky"
+        color="transparent"
+        elevation={0}
+        sx={{ borderBottom: '1px solid #e5e7eb', backdropFilter: 'blur(6px)' }}
+      >
+        <Container
+          maxWidth="md"
+          sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', py: 1.25 }}
+        >
+          <Typography variant="body1" fontWeight={700} sx={{ color: '#111827' }}>
+            {title}
           </Typography>
-          <Chip size="small" label={status} />
-          <IconButton color="primary" onClick={onDisconnect} aria-label="disconnect">
-            <LogoutIcon />
-          </IconButton>
+          <Stack direction="row" spacing={1}>
+            <Button
+              size="small"
+              color="inherit"
+              variant="text"
+              onClick={() => setShowSSELogs((prev) => !prev)}
+            >
+              {showSSELogs ? 'SSE 로그 숨기기' : 'SSE 로그 보기'}
+            </Button>
+            <Button size="small" color="inherit" variant="text" onClick={onDisconnect}>
+              연결 해제
+            </Button>
+          </Stack>
         </Container>
       </AppBar>
 
-      <Container maxWidth="md" sx={{ pt: 3, pb: 3, display: 'flex', flexDirection: 'column', height: 'calc(100vh - 64px)' }}>
+      <Container
+        maxWidth="md"
+        sx={{
+          pt: 0,
+          pb: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          height: 'calc(100vh - 65px)',
+        }}
+      >
         <Paper
           sx={{
-            p: 0,
             flex: 1,
             display: 'flex',
             flexDirection: 'column',
-            borderRadius: 4,
+            borderRadius: 0,
             overflow: 'hidden',
+            boxShadow: 'none',
+            backgroundColor: '#fff',
           }}
-          elevation={4}
+          elevation={0}
         >
-          <Box sx={{ px: 3, py: 2, borderBottom: '1px solid', borderColor: 'divider' }}>
-            <Typography variant="h6" fontWeight={700}>
-              {title}
+          <Box
+            sx={{
+              px: { xs: 2, md: 4 },
+              py: 1,
+              borderBottom: '1px solid #f3f4f6',
+              background: '#fafafa',
+            }}
+          >
+            <Typography variant="caption" sx={{ color: '#6b7280' }}>
+              {status}
             </Typography>
           </Box>
 
@@ -327,13 +361,12 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
             sx={{
               flex: 1,
               overflowY: 'auto',
-              px: 3,
-              py: 2,
+              px: { xs: 2, md: 4 },
+              py: 3,
               display: 'flex',
               flexDirection: 'column',
-              gap: 2,
-              background:
-                'radial-gradient(circle at top right, rgba(11, 92, 255, 0.06), transparent 35%), radial-gradient(circle at 20% 90%, rgba(15, 118, 110, 0.04), transparent 40%)',
+              gap: 2.5,
+              background: '#ffffff',
             }}
           >
             {messages.map((message) => {
@@ -343,98 +376,120 @@ export default function KnowledgeEditor({ mode, localEndpoint, onDisconnect }: K
                   key={message.id}
                   sx={{
                     alignSelf: isUser ? 'flex-end' : 'flex-start',
-                    maxWidth: '85%',
+                    width: '100%',
                     display: 'flex',
-                    alignItems: 'flex-start',
-                    gap: 1,
-                    flexDirection: isUser ? 'row-reverse' : 'row',
+                    justifyContent: isUser ? 'flex-end' : 'flex-start',
                   }}
                 >
-                  <Avatar sx={{ bgcolor: isUser ? 'primary.main' : 'success.main', width: 28, height: 28 }}>
-                    {isUser ? '나' : 'M'}
-                  </Avatar>
-                  <Paper
+                  <Box
                     sx={{
-                      px: 2,
-                      py: 1.25,
-                      borderRadius: 3,
-                      background: isUser ? 'primary.light' : 'background.paper',
-                      border: isUser ? 'none' : '1px solid rgba(15,23,42,0.06)',
-                      color: isUser ? 'primary.contrastText' : 'text.primary',
+                      px: isUser ? 2.2 : 0,
+                      py: isUser ? 1.5 : 0.25,
+                      borderRadius: 6,
+                      maxWidth: { xs: '92%', md: '82%' },
+                      background: isUser ? '#f4f4f5' : 'transparent',
+                      border: isUser ? '1px solid #ececf1' : 'none',
                     }}
                   >
-                    <Typography variant="caption" color={isUser ? 'primary.contrastText' : 'text.secondary'}>
-                      {message.role === 'user' ? '나' : '어시스턴트'} · {message.createdAt}
-                    </Typography>
                     {renderMarkdown(message.text)}
-                    {message.detail ? (
-                      <Typography
-                        variant="caption"
-                        color={isUser ? 'primary.contrastText' : 'text.secondary'}
-                        sx={{ mt: 1, whiteSpace: 'pre-wrap', display: 'block' }}
-                      >
-                        {message.detail}
-                      </Typography>
-                    ) : null}
-                    {Array.isArray(message.thoughts) && message.thoughts.length > 0 ? (
-                      <details>
-                        <summary style={{ cursor: 'pointer', marginTop: 8, userSelect: 'none' }}>사고 로그 보기</summary>
-                        <Typography
-                          variant="caption"
-                          color={isUser ? 'primary.contrastText' : 'text.secondary'}
-                          sx={{ mt: 1, whiteSpace: 'pre-wrap', display: 'block' }}
-                        >
-                          {message.thoughts.join('\n')}
-                        </Typography>
-                      </details>
-                    ) : null}
                     {message.isStreaming ? (
                       <Typography
                         variant="caption"
-                        color={isUser ? 'primary.contrastText' : 'text.secondary'}
-                        sx={{ mt: 1, display: 'block' }}
+                        sx={{ mt: 1, display: 'block', color: '#6b7280' }}
                       >
                         응답 생성 중...
                       </Typography>
                     ) : null}
-                  </Paper>
+                    <Collapse
+                      in={
+                        showSSELogs &&
+                        Array.isArray(message.thoughts) &&
+                        message.thoughts.length > 0
+                      }
+                    >
+                      <Box
+                        sx={{
+                          mt: 1.25,
+                          p: 1.25,
+                          borderRadius: 2,
+                          border: '1px solid #e5e7eb',
+                          background: '#fafafa',
+                        }}
+                      >
+                        <Typography variant="caption" sx={{ color: '#4b5563', fontWeight: 700 }}>
+                          SSE 로그
+                        </Typography>
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            mt: 0.75,
+                            whiteSpace: 'pre-wrap',
+                            display: 'block',
+                            color: '#6b7280',
+                            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                            lineHeight: 1.5,
+                          }}
+                        >
+                          {(message.thoughts || []).join('\n')}
+                        </Typography>
+                      </Box>
+                    </Collapse>
+                  </Box>
                 </Box>
               );
             })}
             <div ref={endOfMessagesRef} />
           </Box>
 
-          <Divider />
-
-          <Box sx={{ p: 2, backgroundColor: 'background.paper' }}>
+          <Divider sx={{ borderColor: '#e5e7eb' }} />
+          <Box sx={{ px: { xs: 2, md: 4 }, py: 2, backgroundColor: '#fff' }}>
             <form
               onSubmit={(event) => {
                 event.preventDefault();
                 handleSubmit();
               }}
             >
-              <Box sx={{ display: 'flex', gap: 1, alignItems: 'flex-end' }}>
+              <Box
+                sx={{
+                  display: 'flex',
+                  gap: 1,
+                  alignItems: 'flex-end',
+                  border: '1px solid #d1d5db',
+                  borderRadius: 5,
+                  p: 0.75,
+                  background: '#ffffff',
+                }}
+              >
                 <TextField
                   fullWidth
                   multiline
                   minRows={1}
                   maxRows={5}
+                  inputRef={inputRef}
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="지식 검색 또는 정리 요청을 입력하세요."
-                  variant="outlined"
+                  placeholder="메시지를 입력하세요"
+                  variant="standard"
                   disabled={loading}
+                  InputProps={{ disableUnderline: true }}
                 />
-                <IconButton
-                  color="primary"
+                <Button
+                  variant="contained"
                   type="submit"
-                  size="large"
                   disabled={loading || !input.trim()}
-                  sx={{ minWidth: 48, height: 48 }}
+                  sx={{
+                    minWidth: 44,
+                    width: 44,
+                    height: 44,
+                    borderRadius: 22,
+                    boxShadow: 'none',
+                    background: '#111827',
+                    '&:hover': { background: '#1f2937' },
+                  }}
                 >
                   <SendIcon />
-                </IconButton>
+                </Button>
               </Box>
             </form>
           </Box>

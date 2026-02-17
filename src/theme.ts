@@ -4,23 +4,24 @@ export const theme = createTheme({
   palette: {
     mode: 'light',
     primary: {
-      main: '#0b5cff',
+      main: '#111827',
     },
     secondary: {
-      main: '#1f2937',
+      main: '#374151',
     },
     background: {
-      default: '#eef2ff',
-      paper: '#f8fafc',
+      default: '#ffffff',
+      paper: '#ffffff',
     },
   },
   typography: {
-    fontFamily: 'Inter, Noto Sans KR, -apple-system, sans-serif',
+    fontFamily:
+      '-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica Neue, Arial, Noto Sans KR, sans-serif',
     h4: {
       fontWeight: 800,
     },
   },
   shape: {
-    borderRadius: 12,
+    borderRadius: 10,
   },
 });

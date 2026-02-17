@@ -16,7 +16,9 @@ const ensureOk = async (response: Response, fallback: string) => {
     return;
   }
   const message = await response.text();
-  throw new Error(`${fallback} (${response.status}): ${message || '엔드포인트 응답이 비정상입니다.'}`);
+  throw new Error(
+    `${fallback} (${response.status}): ${message || '엔드포인트 응답이 비정상입니다.'}`,
+  );
 };
 
 export interface QueryKnowledgeOptions {
@@ -214,15 +216,8 @@ export async function streamKnowledge(
 
   if (!finalData && accumulatedAnswer) {
     const fallbackFinal = {
-      action: finalData?.action || 'local-mcp',
+      action: 'local-mcp',
       answer: accumulatedAnswer,
-      route: finalData?.route,
-      routedQuery: finalData?.routedQuery,
-      explanation: finalData?.explanation,
-      tool: finalData?.tool,
-      arguments: finalData?.arguments,
-      requiresInput: finalData?.requiresInput,
-      missing: finalData?.missing,
     } as KnowledgeResponse;
     options.onFinal?.(fallbackFinal);
     return;
