@@ -7,6 +7,9 @@ const ROUTER_TOOL_SELECTION_FORMAT_GUIDELINES = `
 - paths가 즉시 누락됐더라도 바로 실패하지 말고, 먼저 탐색 도구 계획을 세워 candidate 경로를 찾아라.
 - 탐색이 성공하면 summary 도구 arguments.paths에 candidate 경로를 채워서 이어서 호출해라.
 - 탐색에도 실패하면 그때만 사용자에게 경로를 요청해라.
+- GitHub PR/동기화 의도면 create_pr를 바로 호출하지 말고, 먼저 sync_status를 통해 상태 점검 계획을 세워라.
+- sync_status 결과가 ready_for_pr=true, is_clean=true일 때만 create_pr를 실행하도록 계획해라.
+- sync_status 결과에 has_unpushed_commits, staged_files/unstaged_files/untracked_files를 확인하는 계획을 포함해라.
 `.trim();
 
 export const buildToolSelectionPrompt = (toolSummaries = []) =>

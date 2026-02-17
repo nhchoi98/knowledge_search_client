@@ -1,5 +1,13 @@
 import express from 'express';
 import cors from 'cors';
+import { createOpenAIClient } from './lib/openaiClient.js';
+import { writeSSE, streamText, parseRoutePlan } from './lib/streaming.js';
+import { createOrchestrationRuntime } from './lib/orchestration.js';
+import { normalizeMCPResponse, resolveConversation, proxyResponse } from './lib/mcpShared.js';
+import {
+  summarizeStructuredForDisplay,
+  formatContentArrayAsMarkdown,
+} from './lib/mcpResponseFormatting.js';
 import {
   buildRouteDecisionPrompt,
   buildToolSelectionPrompt,
@@ -17,6 +25,10 @@ const LOCAL_MCP_DEFAULT_PATHS = (process.env.LOCAL_MCP_DEFAULT_PATHS || 'notes/'
   .split(',')
   .map((item) => item.trim())
   .filter(Boolean);
+const { callOpenAI } = createOpenAIClient({
+  apiKey: OPENAI_API_KEY,
+  model: OPENAI_MODEL,
+});
 
 app.use(
   cors({
@@ -39,52 +51,6 @@ app.use((req, res, next) => {
   }
   next();
 });
-
-const normalizeMCPResponse = (payload) => {
-  if (!payload) {
-    return {
-      action: 'local-mcp',
-      answer: '로컬 MCP에서 비어 있는 응답을 받았습니다.',
-    };
-  }
-
-  if (typeof payload.action === 'string' && typeof payload.answer === 'string') {
-    return {
-      action: payload.action,
-      answer: payload.answer,
-    };
-  }
-
-  const answer =
-    (typeof payload.answer === 'string' && payload.answer) ||
-    (typeof payload.content === 'string' && payload.content) ||
-    (typeof payload.message === 'string' && payload.message) ||
-    JSON.stringify(payload, null, 2);
-
-  return {
-    action: payload.action || 'local-mcp',
-    answer,
-  };
-};
-
-const resolveConversation = (rawConversation) => {
-  if (!Array.isArray(rawConversation)) {
-    return [];
-  }
-
-  return rawConversation
-    .filter(
-      (item) =>
-        item &&
-        typeof item.role === 'string' &&
-        (item.role === 'user' || item.role === 'assistant') &&
-        typeof item.text === 'string',
-    )
-    .map((item) => ({
-      role: item.role,
-      content: item.text,
-    }));
-};
 
 const safeParseResponse = async (response) => {
   const text = await response.text();
@@ -502,12 +468,11 @@ const hasSummaryIntent = (prompt) => {
     : false;
 };
 
-const proxyResponse = (result, extras = {}) => {
-  return {
-    ...result.data,
-    ...extras,
-    mcpStatus: result.status,
-  };
+const hasGitHubPRIntent = (prompt) => {
+  if (typeof prompt !== 'string') {
+    return false;
+  }
+  return /(pr|pull request|깃허브|github|동기화|sync|커밋|푸시|배포)/i.test(prompt);
 };
 
 const chooseBestTool = (tools = [], prompt = '') => {
@@ -965,6 +930,33 @@ const planExecutionFromManifest = async ({ prompt, routedQuery, localEndpoint })
   }
 
   const query = routedQuery || prompt;
+  const syncStatusTool = findToolByName(context.tools, 'sync_status');
+  const createPRTool = findToolByName(context.tools, 'create_pr');
+  if (hasGitHubPRIntent(query) && syncStatusTool && createPRTool) {
+    const createPRArgs = sanitizeToolArguments(
+      createPRTool,
+      query,
+      { commit_message: 'Update knowledge' },
+      query,
+    );
+    return {
+      executionPlan: {
+        tool: syncStatusTool.name,
+        toolArguments: {},
+        routedQuery: query,
+        explanation: 'github_pr_workflow_precheck',
+        workflow: {
+          type: 'github_pr',
+          createPR: {
+            tool: createPRTool.name,
+            toolArguments: createPRArgs,
+          },
+        },
+      },
+      context,
+    };
+  }
+
   const llmPlan = await planMCPToolCall(query, context.tools);
   if (llmPlan && llmPlan.tool) {
     const selected = findToolByName(context.tools, llmPlan.tool);
@@ -1064,6 +1056,58 @@ const buildRetryExecutionPlan = (executionPlan = null) => {
   };
 };
 
+const parseSyncStatusPayload = (response) => {
+  const candidate =
+    response && typeof response.result === 'object' && !Array.isArray(response.result)
+      ? response.result
+      : null;
+  if (candidate) {
+    return candidate;
+  }
+
+  if (typeof response?.answer === 'string') {
+    try {
+      const parsed = JSON.parse(response.answer);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    } catch {
+      // noop
+    }
+  }
+
+  return null;
+};
+
+const evaluateGitHubPRReadiness = (syncResponse) => {
+  const payload = parseSyncStatusPayload(syncResponse);
+  if (!payload) {
+    return {
+      canProceed: false,
+      reason: 'sync_status 결과 구조를 파싱하지 못했습니다.',
+      payload: null,
+    };
+  }
+
+  const isClean = payload.is_clean === true;
+  const readyForPr = payload.ready_for_pr === true;
+
+  if (!isClean || !readyForPr) {
+    return {
+      canProceed: false,
+      reason:
+        'PR 생성 전 작업공간 상태를 충족하지 못했습니다. staged/unstaged/untracked/ready_for_pr 상태를 확인해 주세요.',
+      payload,
+    };
+  }
+
+  return {
+    canProceed: true,
+    reason: '',
+    payload,
+  };
+};
+
 const resolveLocalMCPUrl = (body) => {
   if (typeof body?.localEndpoint === 'string' && body.localEndpoint.trim()) {
     try {
@@ -1089,6 +1133,8 @@ const callLocalMCP = async ({
   preplannedToolPlan = null,
   eventEmitter = null,
 }) => {
+  // MCP Agent 실행 핵심 루틴:
+  // initialize -> tools 조회 -> (선택/탐색) -> tools/call -> 결과 정규화
   const targetUrl = resolveLocalMCPUrl({ localEndpoint });
   const emitEvent = (type, payload) => {
     if (typeof eventEmitter === 'function') {
@@ -1651,537 +1697,27 @@ const callLocalMCP = async ({
   return createResponseFromCallResult(callResult);
 };
 
-const callOpenAI = async ({ messages, responseFormat = 'text' }) => {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages,
-      temperature: 0.2,
-      ...(responseFormat === 'json'
-        ? {
-            response_format: {
-              type: 'json_object',
-            },
-          }
-        : {}),
-    }),
-  });
-
-  const text = await response.text();
-  let payload = null;
-  try {
-    payload = text ? JSON.parse(text) : null;
-  } catch {
-    throw new Error(`OpenAI 응답 파싱 실패: ${text || '빈 응답'}`);
-  }
-
-  if (!response.ok) {
-    const reason = payload?.error?.message || text || '요청이 실패했습니다.';
-    throw new Error(`OpenAI API 호출 실패 (${response.status}): ${reason}`);
-  }
-
-  const content = payload?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string') {
-    throw new Error('OpenAI 응답 형식이 비정상입니다.');
-  }
-
-  return content;
-};
-
-const formatHitsAsMarkdown = (payload, heading = '검색 결과') => {
-  const source = payload?.hits;
-  if (!Array.isArray(source) || source.length === 0) {
-    return null;
-  }
-
-  const groups = new Map();
-  for (const item of source) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-
-    const path = String(item.path || 'unknown');
-    if (!groups.has(path)) {
-      groups.set(path, []);
-    }
-
-    const line = typeof item.line === 'number' && Number.isFinite(item.line) ? item.line : null;
-    const snippet = typeof item.snippet === 'string' ? item.snippet.trim() : '';
-    const entry = { line, snippet };
-    groups.get(path).push(entry);
-  }
-
-  const lines = [`## ${heading}`, `총 ${source.length}개 항목을 찾았습니다.`, ''];
-  for (const [path, hits] of groups.entries()) {
-    lines.push(`### ${path}`);
-    for (const hit of hits) {
-      const lineLabel = hit.line ? ` (line ${hit.line})` : '';
-      const snippet = hit.snippet ? ` - ${hit.snippet}` : '';
-      lines.push(`- ${path}${lineLabel}${snippet}`);
-    }
-    lines.push('');
-  }
-
-  return lines.join('\n').trim();
-};
-
-const formatStructuredToolResult = (structuredPayload) => {
-  if (!structuredPayload || typeof structuredPayload !== 'object') {
-    return null;
-  }
-
-  if (typeof structuredPayload.summary === 'string') {
-    const outputPath =
-      structuredPayload.output_path || structuredPayload.path || structuredPayload.outputPath;
-    const header = outputPath ? `## 실행 결과\n- output_path: ${outputPath}` : '## 실행 결과';
-    return `${header}\n\n${structuredPayload.summary.trim()}`;
-  }
-
-  if (structuredPayload.ok === true) {
-    const outputPath =
-      structuredPayload.output_path || structuredPayload.path || structuredPayload.outputPath;
-    if (outputPath || structuredPayload.summary) {
-      const header = outputPath ? `## 실행 결과\n- output_path: ${outputPath}` : '## 실행 결과';
-      if (typeof structuredPayload.summary === 'string' && structuredPayload.summary.trim()) {
-        return `${header}\n\n${structuredPayload.summary.trim()}`;
-      }
-      return `${header}\n`;
-    }
-  }
-
-  if (Array.isArray(structuredPayload.results)) {
-    const source = structuredPayload.results;
-    const grouped = new Map();
-    for (const item of source) {
-      if (!item || typeof item !== 'object') {
-        continue;
-      }
-
-      const path = String(item.path || item.file || 'unknown');
-      if (!grouped.has(path)) {
-        grouped.set(path, []);
-      }
-      grouped.get(path).push(item);
-    }
-
-    const lines = ['## 실행 결과'];
-    for (const [path, items] of grouped.entries()) {
-      lines.push(`### ${path}`);
-      for (const item of items) {
-        const title = item.title ? `- ${item.title}` : '- 항목';
-        const lineInfo = item.line ? ` (line ${item.line})` : '';
-        const snippet = item.snippet ? `\n  - ${item.snippet}` : '';
-        lines.push(`${title}${lineInfo}${snippet}`);
-      }
-      lines.push('');
-    }
-    return lines.join('\n').trim();
-  }
-
-  if (Array.isArray(structuredPayload.hits)) {
-    return formatHitsAsMarkdown(structuredPayload, '검색 결과');
-  }
-
-  return null;
-};
-
-const summarizeStructuredForDisplay = (structuredPayload, toolName) => {
-  const formatted = formatStructuredToolResult(structuredPayload);
-  if (formatted) {
-    return formatted;
-  }
-
-  const body =
-    Object.keys(structuredPayload || {}).length > 0
-      ? `\n\n\`\`\`json\n${JSON.stringify(structuredPayload, null, 2)}\n\`\`\``
-      : '';
-  return `## 실행 결과\n- 도구: ${toolName || 'unknown'}${body}`;
-};
-
-const formatContentArrayAsMarkdown = (contentArrayPayload) => {
-  if (!Array.isArray(contentArrayPayload) || contentArrayPayload.length === 0) {
-    return null;
-  }
-
-  const lines = [];
-  for (const item of contentArrayPayload) {
-    if (item && typeof item.text === 'string' && item.text.trim()) {
-      lines.push(`- ${item.text.trim()}`);
-    }
-  }
-
-  if (lines.length === 0) {
-    return null;
-  }
-
-  return ['## MCP 응답', ...lines].join('\n');
-};
-
-const writeSSE = (res, event, payload) => {
-  const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
-  res.write(`event: ${event}\n`);
-  body
-    .toString()
-    .split('\n')
-    .forEach((line) => {
-      res.write(`data: ${line}\n`);
-    });
-  res.write('\n');
-};
-
-const streamText = (res, fullText, chunkSize = 48) => {
-  if (!fullText) {
-    return;
-  }
-  for (let start = 0; start < fullText.length; start += chunkSize) {
-    writeSSE(res, 'delta', {
-      chunk: fullText.slice(start, start + chunkSize),
-    });
-  }
-};
-
-const parseRoutePlan = (planningText) => {
-  try {
-    const parsed = JSON.parse(planningText);
-    if (parsed && typeof parsed === 'object' && typeof parsed.route === 'string') {
-      return {
-        route: parsed.route === 'chat_only' ? 'chat_only' : 'local_mcp',
-        query: typeof parsed.query === 'string' ? parsed.query.trim() : '',
-        explanation:
-          typeof parsed.explanation === 'string' && parsed.explanation.trim()
-            ? parsed.explanation.trim()
-            : '',
-      };
-    }
-  } catch {
-    // noop
-  }
-
-  return null;
-};
-
-const A2A_PROTOCOL_VERSION = 'a2a.v1';
-
-const AGENT_IDS = {
-  orchestrator: 'orchestrator',
-  plan: 'plan-agent',
-  mcp: 'mcp-agent',
-  output: 'output-agent',
-  chat: 'chat-agent',
-};
-
-const createA2AMessage = ({ from, to, type, requestId, payload = {} }) => ({
-  protocol: A2A_PROTOCOL_VERSION,
-  requestId,
-  from,
-  to,
-  type,
-  timestamp: Date.now(),
-  payload,
+// 오케스트레이션 런타임은 분리 모듈에서 생성하고,
+// index.js는 라우팅/입출력 경계만 담당한다.
+const { A2A_PROTOCOL_VERSION, runOrchestration, runOutputAgentStream } = createOrchestrationRuntime({
+  localMcpEndpoint: LOCAL_MCP_ENDPOINT,
+  buildRouteDecisionPrompt,
+  chatOnlyPrompt: CHAT_ONLY_PROMPT,
+  callOpenAI,
+  callLocalMCP,
+  resolveConversation,
+  proxyResponse,
+  planExecutionFromManifest,
+  shouldRetryForPathIssue,
+  buildRetryExecutionPlan,
+  evaluateGitHubPRReadiness,
+  parseRoutePlan,
+  streamText,
+  writeSSE,
 });
 
-const createRequestId = () => `req_${Date.now()}_${Math.random().toString(16).slice(2, 10)}`;
-
-const runPlanAgent = async ({ prompt, localEndpoint, emit }) => {
-  const requestId = createRequestId();
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.orchestrator,
-      to: AGENT_IDS.plan,
-      type: 'plan.request',
-      requestId,
-      payload: { prompt },
-    }),
-  );
-
-  const planning = await callOpenAI({
-    responseFormat: 'json',
-    messages: [
-      { role: 'system', content: buildRouteDecisionPrompt() },
-      { role: 'user', content: `사용자 요청: ${prompt}` },
-    ],
-  });
-
-  const plan = parseRoutePlan(planning) || {
-    route: 'local_mcp',
-    query: prompt,
-    explanation: '',
-  };
-  const executionAgent = plan.route === 'local_mcp' ? AGENT_IDS.mcp : AGENT_IDS.chat;
-  let executionPlan = null;
-  let manifestContext = null;
-  if (plan.route === 'local_mcp') {
-    const manifestPlanning = await planExecutionFromManifest({
-      prompt,
-      routedQuery: plan.query || prompt,
-      localEndpoint,
-    });
-    executionPlan = manifestPlanning.executionPlan;
-    manifestContext = manifestPlanning.context;
-  }
-
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.plan,
-      to: AGENT_IDS.orchestrator,
-      type: 'plan.response',
-      requestId,
-      payload: {
-        ...plan,
-        executionAgent,
-        hasExecutionPlan: !!executionPlan,
-        manifestOk: manifestContext?.ok === true,
-        manifestStatus: manifestContext?.manifestAttempt?.status || manifestContext?.status || 0,
-      },
-    }),
-  );
-
-  return {
-    requestId,
-    plan,
-    executionAgent,
-    executionPlan,
-    manifestContext,
-  };
-};
-
-const runMCPAgent = async ({
-  requestId,
-  prompt,
-  localEndpoint,
-  conversation,
-  explanation,
-  executionPlan,
-  emit,
-}) => {
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.orchestrator,
-      to: AGENT_IDS.mcp,
-      type: 'execution.request',
-      requestId,
-      payload: {
-        prompt,
-        localEndpoint: localEndpoint || LOCAL_MCP_ENDPOINT,
-        tool: executionPlan?.tool || null,
-      },
-    }),
-  );
-
-  const localResult = await callLocalMCP({
-    prompt,
-    localEndpoint,
-    conversation: resolveConversation(conversation),
-    useLLMPlanner: false,
-    preplannedToolPlan: executionPlan,
-    eventEmitter: (type, payload) => {
-      emit?.(
-        'a2a',
-        createA2AMessage({
-          from: AGENT_IDS.mcp,
-          to: AGENT_IDS.orchestrator,
-          type: 'execution.progress',
-          requestId,
-          payload: { type, ...payload },
-        }),
-      );
-    },
-  });
-
-  const response = proxyResponse(localResult, {
-    route: 'local_mcp',
-    routedQuery: prompt,
-    explanation,
-  });
-
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.mcp,
-      to: AGENT_IDS.orchestrator,
-      type: 'execution.response',
-      requestId,
-      payload: {
-        status: response.mcpStatus || 200,
-        tool: response.tool || null,
-      },
-    }),
-  );
-
-  return response;
-};
-
-const runChatAgent = async ({ requestId, prompt, explanation, emit }) => {
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.orchestrator,
-      to: AGENT_IDS.chat,
-      type: 'execution.request',
-      requestId,
-      payload: { prompt },
-    }),
-  );
-
-  const answer = await callOpenAI({
-    responseFormat: 'text',
-    messages: [
-      { role: 'system', content: CHAT_ONLY_PROMPT },
-      { role: 'user', content: prompt },
-    ],
-  });
-
-  const response = {
-    action: 'chat-only',
-    answer,
-    route: 'chat_only',
-    routedQuery: prompt,
-    explanation,
-    mcpStatus: 200,
-  };
-
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.chat,
-      to: AGENT_IDS.orchestrator,
-      type: 'execution.response',
-      requestId,
-      payload: { status: 200 },
-    }),
-  );
-
-  return response;
-};
-
-const EXECUTION_AGENT_REGISTRY = {
-  [AGENT_IDS.mcp]: runMCPAgent,
-  [AGENT_IDS.chat]: runChatAgent,
-};
-
-const runOrchestration = async ({ prompt, localEndpoint, conversation, emit }) => {
-  const { requestId, plan, executionAgent, executionPlan, manifestContext } = await runPlanAgent({
-    prompt,
-    localEndpoint,
-    emit,
-  });
-  const execute = EXECUTION_AGENT_REGISTRY[executionAgent] || runMCPAgent;
-  const routedPrompt = plan.query || prompt;
-  if (executionAgent === AGENT_IDS.mcp && !executionPlan) {
-    return {
-      requestId,
-      executionAgent,
-      plan,
-      executionPlan: null,
-      retried: false,
-      manifestContext,
-      response: {
-        action: 'local-mcp',
-        answer:
-          'Plan Agent가 manifest/tools 정보를 기반으로 실행 계획을 만들지 못했습니다. 로컬 MCP manifest/tools/list 상태를 확인해 주세요.',
-        route: 'local_mcp',
-        routedQuery: routedPrompt,
-        explanation: plan.explanation,
-        requiresInput: true,
-        missing: 'execution_plan',
-        mcpStatus: 200,
-      },
-    };
-  }
-
-  let response = await execute({
-    requestId,
-    prompt: routedPrompt,
-    localEndpoint,
-    conversation,
-    explanation: plan.explanation,
-    executionPlan,
-    emit,
-  });
-  let retried = false;
-
-  if (executionAgent === AGENT_IDS.mcp && shouldRetryForPathIssue(response)) {
-    const retryPlan = buildRetryExecutionPlan(executionPlan);
-    if (retryPlan) {
-      retried = true;
-      emit?.(
-        'a2a',
-        createA2AMessage({
-          from: AGENT_IDS.orchestrator,
-          to: AGENT_IDS.plan,
-          type: 'plan.retry',
-          requestId,
-          payload: {
-            reason: 'paths_not_found',
-            retryPaths: retryPlan?.toolArguments?.paths || [],
-          },
-        }),
-      );
-
-      response = await execute({
-        requestId,
-        prompt: routedPrompt,
-        localEndpoint,
-        conversation,
-        explanation: plan.explanation,
-        executionPlan: retryPlan,
-        emit,
-      });
-    }
-  }
-
-  return {
-    requestId,
-    executionAgent,
-    plan,
-    executionPlan,
-    retried,
-    manifestContext,
-    response,
-  };
-};
-
-const runOutputAgentStream = ({ res, response, requestId, emit }) => {
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.orchestrator,
-      to: AGENT_IDS.output,
-      type: 'output.request',
-      requestId,
-      payload: {
-        mode: 'stream',
-      },
-    }),
-  );
-
-  streamText(res, String(response?.answer || ''));
-  writeSSE(res, 'final', response);
-  writeSSE(res, 'done', { ok: true });
-
-  emit?.(
-    'a2a',
-    createA2AMessage({
-      from: AGENT_IDS.output,
-      to: AGENT_IDS.orchestrator,
-      type: 'output.done',
-      requestId,
-      payload: {
-        delivered: true,
-      },
-    }),
-  );
-};
-
 app.post('/api/mcp/chat/stream', async (req, res) => {
+  // 스트리밍 엔드포인트: 오케스트레이션 결과를 SSE(delta/final/done)로 전송
   const { prompt, localEndpoint, conversation } = req.body || {};
 
   if (!OPENAI_API_KEY) {
@@ -2241,6 +1777,7 @@ app.post('/api/mcp/chat/stream', async (req, res) => {
           plan: orchestration.plan,
           executionPlan: orchestration.executionPlan,
           retried: orchestration.retried,
+          workflow: orchestration.workflowState,
           manifest: {
             ok: orchestration.manifestContext?.ok === true,
             status:
@@ -2264,6 +1801,7 @@ app.post('/api/mcp/chat/stream', async (req, res) => {
 });
 
 app.post('/api/mcp/chat', async (req, res) => {
+  // 비스트리밍 엔드포인트: 동일 오케스트레이션 경로를 JSON 응답으로 반환
   const { prompt, localEndpoint, conversation } = req.body || {};
 
   if (!OPENAI_API_KEY) {
@@ -2306,6 +1844,7 @@ app.post('/api/mcp/chat', async (req, res) => {
         plan: orchestration.plan,
         executionPlan: orchestration.executionPlan,
         retried: orchestration.retried,
+        workflow: orchestration.workflowState,
         manifest: {
           ok: orchestration.manifestContext?.ok === true,
           status:
